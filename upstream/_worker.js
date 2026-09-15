@@ -1,4 +1,4 @@
-﻿import { connect } from 'cloudflare:sockets';
+import { connect } from 'cloudflare:sockets';
 
 const CHECK_TIMEOUT_MS = 12000;
 const CONNECT_TIMEOUT_MS = 9999;

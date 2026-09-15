@@ -1,0 +1,70 @@
+name: Upstream Sync
+
+# 本仓库不是 GitHub 意义上的 fork（fork: false），
+# 所以网页上的 "Sync fork" 按钮不存在，只能靠这个工作流自己拉上游。
+# 同步策略：只覆盖 upstream/_worker.js 这一个文件，
+# 我们自己的改动全部在 src/ 下，因此永远不会产生合并冲突。
+
+on:
+  schedule:
+    - cron: "0 3 * * *" # 每天 UTC 03:00
+  workflow_dispatch:
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync_upstream:
+    name: Sync upstream/_worker.js
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_REPO: https://github.com/cmliu/CF-Workers-CheckSocks5.git
+      UPSTREAM_BRANCH: main
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Fetch upstream
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM_REPO" 2>/dev/null || git remote set-url upstream "$UPSTREAM_REPO"
+          git fetch --depth=1 upstream "$UPSTREAM_BRANCH"
+          REV="$(git rev-parse FETCH_HEAD)"
+          echo "UPSTREAM_REV=$REV" >> "$GITHUB_ENV"
+          echo "==> 上游 commit $(printf '%s' "$REV" | cut -c1-8)"
+
+      - name: Write upstream worker
+        run: |
+          set -euo pipefail
+          git show FETCH_HEAD:_worker.js | node tools/sync-upstream.mjs upstream/_worker.js
+          rm -f upstream/_worker.js.check.mjs
+
+      - name: Commit and push when changed
+        run: |
+          set -euo pipefail
+          REV_SHORT="$(printf '%s' "$UPSTREAM_REV" | cut -c1-8)"
+          git config user.name "GH Action - Upstream Sync"
+          git config user.email "action@github.com"
+          git add upstream/_worker.js upstream/UPSTREAM_REV
+
+          if git diff --cached --quiet; then
+            echo "==> 上游无变化，无需提交"
+            exit 0
+          fi
+
+          git commit -m "chore: sync upstream _worker.js ($REV_SHORT)"
+          git push origin main
+          echo "==> 已提交并推送，部署工作流会随后自动触发"

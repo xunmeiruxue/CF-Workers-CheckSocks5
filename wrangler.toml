@@ -1,13 +1,20 @@
 name = "cf-workers-check-socks5"
-main = "./_worker.js"
+main = "src/index.js"
 compatibility_date = "2026-05-01"
 workers_dev = true
+keep_vars = true
+
+# 上游代码在 upstream/_worker.js，由 .github/workflows/sync.yml 自动同步；
+# 本仓库的改动全部在 src/ 下，因此同步上游永远不会冲突。
 
 # Optional: bind a custom domain route instead of *.workers.dev
 # routes = [
 #   { pattern = "check.example.com/*", zone_name = "example.com" }
 # ]
 
-# Optional: override the footer HTML exposed as env.BEIAN in the Worker
+# Optional: 下面这些变量都可以不配置，默认值已经够用
 # [vars]
-# BEIAN = "Example footer HTML"
+# BEIAN = "Example footer HTML"          # 页面页脚 HTML
+# SUBSCRIPTION_UA = "v2rayN/6.0"         # 抓取订阅时使用的 User-Agent
+# SUBSCRIPTION_LIMIT = "1500"            # 单次订阅最多返回的节点数
+# SUBSCRIPTION_DISABLED = "0"            # 设为 "1" 可关掉订阅抓取功能

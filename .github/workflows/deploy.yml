@@ -1,0 +1,191 @@
+name: Deploy to Cloudflare Workers
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_beian:
+        description: "用 1Password 的 BEIAN 变量覆盖 Worker 上已有的 BEIAN"
+        required: false
+        type: boolean
+        default: false
+
+  # sync.yml 用 GITHUB_TOKEN 推送，这类推送不会触发 push 事件，所以单独监听它
+  workflow_run:
+    workflows: ["Upstream Sync"]
+    types: [completed]
+
+  push:
+    branches: [main]
+    paths:
+      - "upstream/**"
+      - "src/**"
+      - "wrangler.toml"
+      - "package.json"
+      - ".github/workflows/deploy.yml"
+
+concurrency:
+  group: cf-workers-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to Workers
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+
+    env:
+      WORKER_NAME: cf-workers-check-socks5
+      OP_ENV_ID: cyabk5r5mgusn4s235akppesoq
+      FORCE_BEIAN: ${{ inputs.force_beian || false }}
+      OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: main
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Install wrangler
+        run: npm install -g wrangler@4
+
+      - name: Install 1Password CLI (beta)
+        if: ${{ env.OP_SERVICE_ACCOUNT_TOKEN != '' }}
+        uses: 1password/install-cli-action@v4
+        with:
+          version: latest-beta
+
+      - name: Resolve Cloudflare token
+        run: |
+          set -euo pipefail
+
+          if [ -z "$OP_SERVICE_ACCOUNT_TOKEN" ]; then
+            echo "::error::仓库 secret OP_SERVICE_ACCOUNT_TOKEN 未配置"
+            exit 1
+          fi
+          if ! command -v op >/dev/null 2>&1; then
+            echo "::error::未找到 op CLI，检查 Install 1Password CLI 步骤"
+            exit 1
+          fi
+
+          TOKEN_LEN="$(printf '%s' "$OP_SERVICE_ACCOUNT_TOKEN" | wc -c)"
+          case "$OP_SERVICE_ACCOUNT_TOKEN" in
+            ops_*) echo "==> token 格式检查通过（ops_ 前缀，长度 $TOKEN_LEN）" ;;
+            *) echo "::error::token 不是 ops_ 开头（当前长度 $TOKEN_LEN），可能复制错了内容"; exit 1 ;;
+          esac
+          case "$OP_SERVICE_ACCOUNT_TOKEN" in
+            *[[:space:]]*) echo "::error::token 含空白字符，复制时多半带入了换行或空格"; exit 1 ;;
+          esac
+
+          if ! OP_ERRSHOWN="$(op user get --me 2>&1)"; then
+            echo "::error::service account 认证失败，op 原始输出："
+            echo "$OP_ERRSHOWN"
+            exit 1
+          fi
+
+          SEC_DIR="$(mktemp -d)"
+          chmod 700 "$SEC_DIR"
+          if ! OP_ERR="$(op run --environment "$OP_ENV_ID" -- bash -c 'umask 077; printf "%s" "$cloudflare_workers" > "$1/workers_token"; printf "%s" "$cloudflare" > "$1/cloudflare_token"; printf "%s" "$BEIAN" > "$1/beian_upper"; printf "%s" "$beian" > "$1/beian_lower"' _ "$SEC_DIR" 2>&1)"; then
+            echo "::error::读取 1Password Environment 失败，op 原始报错："
+            echo "$OP_ERR"
+            echo "::error::常见原因：service account 创建时未勾选 edgetunnel 的 Read 权限（此授权创建后不可改，需重建）"
+            rm -rf "$SEC_DIR"
+            exit 1
+          fi
+
+          TOKEN="$(cat "$SEC_DIR/workers_token" 2>/dev/null || true)"
+          if [ -z "$TOKEN" ]; then
+            TOKEN="$(cat "$SEC_DIR/cloudflare_token" 2>/dev/null || true)"
+            echo "==> 使用 edgetunnel 环境里的 cloudflare 变量"
+          else
+            echo "==> 使用 edgetunnel 环境里的 cloudflare_workers 变量"
+          fi
+
+          BEIAN_VALUE="$(cat "$SEC_DIR/beian_upper" 2>/dev/null || true)"
+          if [ -z "$BEIAN_VALUE" ]; then
+            BEIAN_VALUE="$(cat "$SEC_DIR/beian_lower" 2>/dev/null || true)"
+          fi
+          rm -rf "$SEC_DIR"
+
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Environment 里既没有 cloudflare_workers 也没有 cloudflare，检查变量名拼写"
+            exit 1
+          fi
+
+          echo "::add-mask::$TOKEN"
+          echo "CLOUDFLARE_API_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+          if [ -n "$BEIAN_VALUE" ]; then
+            echo "::add-mask::$BEIAN_VALUE"
+            echo "BEIAN_VALUE=$BEIAN_VALUE" >> "$GITHUB_ENV"
+            echo "==> BEIAN 已获取"
+          else
+            echo "==> Environment 里没有 BEIAN，沿用代码内置页脚"
+          fi
+
+      - name: Resolve account id
+        run: |
+          set -euo pipefail
+          ACCOUNT_ID="$(curl -fsS "https://api.cloudflare.com/client/v4/accounts" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq -r '.result[0].id // empty')"
+          if [ -z "$ACCOUNT_ID" ]; then
+            echo "::error::无法获取 account id，请确认令牌具备 Account Settings:Read 权限"
+            exit 1
+          fi
+          echo "CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID" >> "$GITHUB_ENV"
+          echo "==> account id 已解析"
+
+      - name: Check Workers permission
+        run: |
+          set -euo pipefail
+          CODE="$(curl -sS -o /tmp/workers-scripts.json -w '%{http_code}' \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" || echo 000)"
+          case "$CODE" in
+            200)
+              echo "==> 令牌具备 Workers 访问权限，可以部署"
+              ;;
+            *)
+              echo "::error::令牌缺少 Workers 权限（HTTP $CODE），部署一定会失败，已提前拦下"
+              echo "::error::处理方式：Cloudflare 面板 → My Profile → API Tokens → 编辑该令牌 → Permissions 补一条 Account / Workers Scripts / Edit"
+              echo "::error::或者新建令牌后在 1Password 的 edgetunnel 环境里加一个 cloudflare_workers 变量，工作流会优先使用它"
+              cat /tmp/workers-scripts.json 2>/dev/null || true
+              exit 1
+              ;;
+          esac
+
+      - name: Deploy Worker
+        run: |
+          set -euo pipefail
+          set +o pipefail
+          wrangler deploy 2>&1 | sed -E 's#https?://[^[:space:]]+#<URL 已隐去>#g'
+          STATUS=${PIPESTATUS[0]}
+          set -o pipefail
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::error::部署失败，退出码 $STATUS"
+            echo "::error::若报 10000 / 9106 之类的认证或权限错误，检查令牌是否具备 Workers Scripts:Edit"
+            exit "$STATUS"
+          fi
+          echo "==> 部署成功"
+
+      - name: Sync BEIAN secret
+        if: ${{ env.BEIAN_VALUE != '' }}
+        run: |
+          set -euo pipefail
+          CONFIGURED=0
+          if wrangler secret list --name "$WORKER_NAME" 2>/dev/null | grep -q BEIAN; then
+            CONFIGURED=1
+          fi
+          if [ "$CONFIGURED" = "1" ] && [ "$FORCE_BEIAN" != "true" ]; then
+            echo "==> BEIAN 已存在，跳过（需要覆盖请手动触发并勾选 force_beian）"
+            exit 0
+          fi
+          printf '%s' "$BEIAN_VALUE" | wrangler secret put BEIAN --name "$WORKER_NAME"
+          echo "==> BEIAN 已写入 Worker secret"
